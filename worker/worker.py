@@ -2,7 +2,6 @@ import redis
 import time
 import os
 import signal
-import sys
 from pathlib import Path
 
 redis_host = os.getenv("REDIS_HOST", "redis")
