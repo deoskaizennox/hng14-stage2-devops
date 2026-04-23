@@ -20,6 +20,7 @@ redis_host = os.getenv("REDIS_HOST", "redis")
 redis_port = int(os.getenv("REDIS_PORT", "6379"))
 r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
 
+
 @app.get("/health")
 def health():
     try:
@@ -27,6 +28,7 @@ def health():
         return {"status": "healthy", "redis": "connected"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Redis unreachable: {e}")
+
 
 @app.post("/jobs")
 def create_job():
@@ -37,6 +39,7 @@ def create_job():
         return {"job_id": job_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
