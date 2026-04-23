@@ -1,12 +1,12 @@
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 from main import app
 
 
 @pytest.fixture
 def client():
-    """Create a FastAPI test client"""
+    """Create a test client"""
     return TestClient(app)
 
 
@@ -21,10 +21,9 @@ def test_health_endpoint(client):
 @patch('main.r')
 def test_create_job(mock_redis, client):
     """Test job creation with mocked Redis"""
-    # Mock Redis methods
     mock_redis.lpush.return_value = 1
     mock_redis.hset.return_value = 1
-    
+
     response = client.post('/jobs')
     assert response.status_code == 200
     json_data = response.json()
@@ -36,7 +35,7 @@ def test_create_job(mock_redis, client):
 def test_get_job_exists(mock_redis, client):
     """Test getting a job that exists"""
     mock_redis.hget.return_value = 'queued'
-    
+
     response = client.get('/jobs/test-job-123')
     assert response.status_code == 200
     json_data = response.json()
@@ -48,6 +47,6 @@ def test_get_job_exists(mock_redis, client):
 def test_get_job_not_found(mock_redis, client):
     """Test 404 for non-existent job"""
     mock_redis.hget.return_value = None
-    
+
     response = client.get('/jobs/nonexistent-id')
     assert response.status_code == 404
