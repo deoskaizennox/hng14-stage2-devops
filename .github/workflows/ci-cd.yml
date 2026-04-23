@@ -1,0 +1,254 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: localhost:5000
+  API_IMAGE: localhost:5000/api
+  WORKER_IMAGE: localhost:5000/worker
+  FRONTEND_IMAGE: localhost:5000/frontend
+
+jobs:
+  # Stage 1: Lint
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Linters
+        run: |
+          pip install flake8
+          npm install -g eslint
+
+      - name: Lint Python
+        run: |
+          flake8 api/ worker/ --count --show-source --statistics
+
+      - name: Lint JavaScript
+        run: |
+          cd frontend
+          npm install
+          npx eslint .
+
+      - name: Lint Dockerfiles
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: api/Dockerfile
+          ignore: DL3008,DL3018
+          failure-threshold: warning
+
+  # Stage 2: Test
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Test Dependencies
+        run: |
+          cd api
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run Tests & Generate Coverage
+        run: |
+          cd api
+          pytest tests/ --cov=. --cov-report=xml
+
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: api/coverage.xml
+
+  # Stage 3: Build
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Images to Local Registry
+        run: |
+          # Build API
+          docker build -t ${{ env.API_IMAGE }}:${{ github.sha }} -t ${{ env.API_IMAGE }}:latest ./api
+          docker push ${{ env.API_IMAGE }}:${{ github.sha }}
+          docker push ${{ env.API_IMAGE }}:latest
+
+          # Build Worker
+          docker build -t ${{ env.WORKER_IMAGE }}:${{ github.sha }} -t ${{ env.WORKER_IMAGE }}:latest ./worker
+          docker push ${{ env.WORKER_IMAGE }}:${{ github.sha }}
+          docker push ${{ env.WORKER_IMAGE }}:latest
+
+          # Build Frontend
+          docker build -t ${{ env.FRONTEND_IMAGE }}:${{ github.sha }} -t ${{ env.FRONTEND_IMAGE }}:latest ./frontend
+          docker push ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+          docker push ${{ env.FRONTEND_IMAGE }}:latest
+
+      - name: Save Images as Artifacts
+        run: |
+          docker save ${{ env.API_IMAGE }}:latest | gzip > api-image.tar.gz
+          docker save ${{ env.WORKER_IMAGE }}:latest | gzip > worker-image.tar.gz
+          docker save ${{ env.FRONTEND_IMAGE }}:latest | gzip > frontend-image.tar.gz
+
+      - name: Upload Docker Images
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: |
+            api-image.tar.gz
+            worker-image.tar.gz
+            frontend-image.tar.gz
+
+  # Stage 4: Security Scan
+  security-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker Images
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Images
+        run: |
+          docker load < api-image.tar.gz
+          docker load < worker-image.tar.gz
+          docker load < frontend-image.tar.gz
+
+      - name: Run Trivy Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.API_IMAGE }}:latest'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          exit-code: '1'
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Stage 5: Integration Test
+  integration-test:
+    needs: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker Images
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Images
+        run: |
+          docker load < api-image.tar.gz
+          docker load < worker-image.tar.gz
+          docker load < frontend-image.tar.gz
+
+      - name: Start Stack
+        run: |
+          docker-compose up -d
+
+      - name: Wait for Services
+        run: |
+          echo "Waiting for API to be ready..."
+          for i in {1..30}; do
+            if curl -f http://localhost:8000/health > /dev/null; then
+              echo "API is ready!"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Run Integration Test
+        run: |
+          # Submit a job
+          RESPONSE=$(curl -s -X POST http://localhost:8000/jobs)
+          JOB_ID=$(echo $RESPONSE | jq -r '.job_id')
+          echo "Submitted job: $JOB_ID"
+
+          # Poll for completion
+          STATUS="pending"
+          for i in {1..15}; do
+            STATUS=$(curl -s http://localhost:8000/jobs/$JOB_ID | jq -r '.status')
+            echo "Job status: $STATUS"
+            if [ "$STATUS" == "completed" ]; then
+              echo "Job completed successfully!"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Job did not complete in time"
+          exit 1
+
+      - name: Tear Down
+        if: always()
+        run: docker-compose down -v
+
+  # Stage 6: Deploy
+  deploy:
+    needs: integration-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker Images
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Images
+        run: |
+          docker load < api-image.tar.gz
+
+      - name: Deploy Rolling Update
+        run: |
+          chmod +x scripts/deploy.sh
+          # Note: This script is for demonstration in CI
+          # In a real scenario, this would SSH to a remote server
+          echo "Simulating deployment logic..."
+          ./scripts/deploy.sh
